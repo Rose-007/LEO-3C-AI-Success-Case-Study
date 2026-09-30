@@ -236,12 +236,67 @@ const SHA256 = (() => {
 })();
 
 // ====================================================================
-// Token Counter and Rabbit RAM storage layer with SHA256 + Signature
+// Token ID Generator (BTM-LEO3C-YYYYMMDD-XXXX format)
+// ====================================================================
+const TokenIDGenerator = (() => {
+    let dailyCounter = {};
+
+    const formatDate = (date) => {
+        const y = date.getFullYear();
+        const m = String(date.getMonth() + 1).padStart(2, '0');
+        const d = String(date.getDate()).padStart(2, '0');
+        return `${y}${m}${d}`;
+    };
+
+    const generateSerialNumber = (dateStr) => {
+        if (!dailyCounter[dateStr]) {
+            dailyCounter[dateStr] = 0;
+        }
+        dailyCounter[dateStr]++;
+        return String(dailyCounter[dateStr]).padStart(4, '0');
+    };
+
+    return {
+        generate: () => {
+            const now = new Date();
+            const dateStr = formatDate(now);
+            const serial = generateSerialNumber(dateStr);
+            return `BTM-LEO3C-${dateStr}-${serial}`;
+        },
+
+        parse: (tokenId) => {
+            const pattern = /^BTM-LEO3C-(\d{8})-(\d{4})$/;
+            const match = tokenId.match(pattern);
+            if (!match) return null;
+            
+            const dateStr = match[1];
+            const serial = match[2];
+            return {
+                prefix: 'BTM-LEO3C',
+                date: dateStr,
+                serial: serial,
+                year: parseInt(dateStr.substring(0, 4)),
+                month: parseInt(dateStr.substring(4, 6)),
+                day: parseInt(dateStr.substring(6, 8))
+            };
+        }
+    };
+})();
+
+// ====================================================================
+// Token Counter and Rabbit RAM storage layer with SHA256 + Valuation
 // ====================================================================
 (function() {
     const STORAGE_KEY = 'leo3c-rabbit-ram-tokens';
     const SIGNATURE_KEY = 'leo3c-rabbit-ram-sig';
     let memoryTokens = [];
+
+    // Valuation status constants
+    const VALUATION_STATUS = {
+        PROOF_ONLY: 'PROOF_ONLY',      // Token created, proof only, no value yet
+        ACTIVATED: 'ACTIVATED',        // Token activated for valuation
+        VALUED: 'VALUED'               // Real value assigned
+    };
 
     function readTokens() {
         try {
@@ -264,13 +319,6 @@ const SHA256 = (() => {
         }
     }
 
-    function generateTokenId() {
-        if (typeof crypto !== 'undefined' && crypto.randomUUID) {
-            return crypto.randomUUID();
-        }
-        return `token-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
-    }
-
     // Generate timestamp signature
     function generateTimestampSignature() {
         const timestamp = Date.now();
@@ -290,6 +338,9 @@ const SHA256 = (() => {
             count: token.count,
             costIncurred: token.costIncurred,
             royalty: token.royalty,
+            realValue: token.realValue,
+            btmValue: token.btmValue,
+            valuationStatus: token.valuationStatus,
             createdAt: token.createdAt
         });
 
@@ -304,9 +355,9 @@ const SHA256 = (() => {
     function sanitizeRecord(record) {
         const tsSig = generateTimestampSignature();
         return {
-            tokenId: record.tokenId || generateTokenId(),
+            tokenId: record.tokenId || TokenIDGenerator.generate(),
             topic: record.topic || 'general',
-            status: record.status || 'created',
+            status: record.status || 'Order',
             source: record.source || 'system',
             ipAddress: record.ipAddress || 'unknown',
             createdAt: record.createdAt || new Date().toISOString(),
@@ -314,6 +365,11 @@ const SHA256 = (() => {
             count: Number.isFinite(record.count) ? record.count : 1,
             costIncurred: Number.isFinite(record.costIncurred) ? record.costIncurred : 0,
             royalty: Number.isFinite(record.royalty) ? record.royalty : 0,
+            // NEW: Valuation fields
+            realValue: Number.isFinite(record.realValue) ? record.realValue : 0,
+            btmValue: Number.isFinite(record.btmValue) ? record.btmValue : 0,
+            valuationStatus: record.valuationStatus || VALUATION_STATUS.PROOF_ONLY,
+            // Signature fields
             metadata: record.metadata || {},
             tstSignature: record.tstSignature || tsSig.signature,
             tstTimestamp: record.tstTimestamp || tsSig.timestamp
@@ -321,14 +377,20 @@ const SHA256 = (() => {
     }
 
     const TokenCounter = {
+        // Constants
+        VALUATION_STATUS,
+
         async createToken(details = {}) {
             const tokens = readTokens();
             const record = sanitizeRecord({
                 ...details,
-                tokenId: details.tokenId || generateTokenId(),
+                tokenId: details.tokenId || TokenIDGenerator.generate(),
                 createdAt: details.createdAt || new Date().toISOString(),
                 updatedAt: details.updatedAt || new Date().toISOString(),
                 count: Number.isFinite(details.count) ? details.count : 1,
+                realValue: Number.isFinite(details.realValue) ? details.realValue : 0,
+                btmValue: Number.isFinite(details.btmValue) ? details.btmValue : 0,
+                valuationStatus: details.valuationStatus || VALUATION_STATUS.PROOF_ONLY,
                 metadata: details.metadata || {}
             });
 
@@ -379,6 +441,55 @@ const SHA256 = (() => {
             return updated;
         },
 
+        // NEW: Activate token for valuation
+        async activateToken(tokenId) {
+            return this.updateToken(tokenId, {
+                valuationStatus: VALUATION_STATUS.ACTIVATED
+            });
+        },
+
+        // NEW: Set real value and update status to VALUED
+        async setRealValue(tokenId, realValue, btmValue = 0) {
+            if (!Number.isFinite(realValue) || realValue < 0) {
+                console.error('Invalid realValue:', realValue);
+                return null;
+            }
+
+            return this.updateToken(tokenId, {
+                realValue: realValue,
+                btmValue: Number.isFinite(btmValue) ? btmValue : 0,
+                valuationStatus: VALUATION_STATUS.VALUED
+            });
+        },
+
+        // NEW: Get tokens by valuation status
+        getTokensByValuationStatus(status) {
+            const validStatus = Object.values(VALUATION_STATUS);
+            if (!validStatus.includes(status)) {
+                console.warn(`Invalid valuation status: ${status}`);
+                return [];
+            }
+            return readTokens().filter(token => token.valuationStatus === status);
+        },
+
+        // NEW: Get total value across tokens
+        getTotalValue(valuationStatus = null) {
+            let tokens = readTokens();
+            if (valuationStatus) {
+                tokens = tokens.filter(t => t.valuationStatus === valuationStatus);
+            }
+            return tokens.reduce((sum, token) => sum + token.realValue, 0);
+        },
+
+        // NEW: Get total BTM value
+        getTotalBTMValue(valuationStatus = null) {
+            let tokens = readTokens();
+            if (valuationStatus) {
+                tokens = tokens.filter(t => t.valuationStatus === valuationStatus);
+            }
+            return tokens.reduce((sum, token) => sum + token.btmValue, 0);
+        },
+
         async verifyTokenIntegrity(token) {
             if (!token.sha256) {
                 console.warn('Token missing sha256 hash');
@@ -401,6 +512,15 @@ const SHA256 = (() => {
                 source: 'rabbit-ram',
                 generatedAt: new Date().toISOString(),
                 totalTokens: tokens.length,
+                valuationSummary: {
+                    totalRealValue: this.getTotalValue(),
+                    totalBTMValue: this.getTotalBTMValue(),
+                    byStatus: {
+                        [VALUATION_STATUS.PROOF_ONLY]: this.getTotalValue(VALUATION_STATUS.PROOF_ONLY),
+                        [VALUATION_STATUS.ACTIVATED]: this.getTotalValue(VALUATION_STATUS.ACTIVATED),
+                        [VALUATION_STATUS.VALUED]: this.getTotalValue(VALUATION_STATUS.VALUED)
+                    }
+                },
                 tokens: tokens.map(token => ({
                     tokenId: token.tokenId,
                     topic: token.topic,
@@ -412,6 +532,9 @@ const SHA256 = (() => {
                     count: token.count,
                     costIncurred: token.costIncurred,
                     royalty: token.royalty,
+                    realValue: token.realValue,
+                    btmValue: token.btmValue,
+                    valuationStatus: token.valuationStatus,
                     metadata: token.metadata,
                     sha256: token.sha256 || 'pending',
                     tstSignature: token.tstSignature,
@@ -452,6 +575,7 @@ const SHA256 = (() => {
     if (typeof window !== 'undefined') {
         window.TokenCounter = TokenCounter;
         window.tokenCounter = TokenCounter;
+        window.TokenIDGenerator = TokenIDGenerator;
     }
 
     if (typeof module !== 'undefined' && module.exports) {
@@ -472,3 +596,5 @@ console.log('Personal IP Protection - MIT License');
 console.log('Architecture: IA&IB');
 console.log('Token Counter Ready:', typeof window !== 'undefined' ? window.TokenCounter?.countTokens?.() : 'browser-only');
 console.log('SHA256 + Timestamp Signature: ENABLED');
+console.log('Token Valuation System: ENABLED (PROOF_ONLY | ACTIVATED | VALUED)');
+console.log('Token ID Format: BTM-LEO3C-YYYYMMDD-XXXX');
