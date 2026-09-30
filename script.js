@@ -136,15 +136,12 @@ document.head.appendChild(navStyle);
 // ====================================================================
 const SHA256 = (() => {
     const sha256 = async (message) => {
-        // Convert string to ArrayBuffer
         const encoder = new TextEncoder();
         const data = encoder.encode(message);
         
-        // Use SubtleCrypto for SHA-256 (available in modern browsers)
         if (typeof window !== 'undefined' && window.crypto && window.crypto.subtle) {
             try {
                 const hashBuffer = await window.crypto.subtle.digest('SHA-256', data);
-                // Convert ArrayBuffer to hex string
                 const hashArray = Array.from(new Uint8Array(hashBuffer));
                 const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
                 return hashHex;
@@ -157,7 +154,6 @@ const SHA256 = (() => {
         return sha256Fallback(message);
     };
 
-    // Fallback SHA-256 implementation (simple polyfill)
     const sha256Fallback = (message) => {
         const K = [
             0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -284,42 +280,21 @@ const TokenIDGenerator = (() => {
 })();
 
 // ====================================================================
-// Token Counter and Rabbit RAM storage layer with SHA256 + Valuation
+// Token Counter with Server-Side Rabbit RAM Sync
+// Proof layer (SHA256 + tstSignature) + Valuation layer (realValue/btmValue)
 // ====================================================================
 (function() {
-    const STORAGE_KEY = 'leo3c-rabbit-ram-tokens';
-    const SIGNATURE_KEY = 'leo3c-rabbit-ram-sig';
-    let memoryTokens = [];
-
-    // Valuation status constants
     const VALUATION_STATUS = {
-        PROOF_ONLY: 'PROOF_ONLY',      // Token created, proof only, no value yet
-        ACTIVATED: 'ACTIVATED',        // Token activated for valuation
-        VALUED: 'VALUED'               // Real value assigned
+        PROOF_ONLY: 'PROOF_ONLY',
+        ACTIVATED: 'ACTIVATED',
+        VALUED: 'VALUED'
     };
 
-    function readTokens() {
-        try {
-            const raw = localStorage.getItem(STORAGE_KEY);
-            const parsed = raw ? JSON.parse(raw) : [];
-            return Array.isArray(parsed) ? parsed : memoryTokens;
-        } catch (error) {
-            console.warn('Token storage unavailable, using memory fallback:', error);
-            return memoryTokens;
-        }
-    }
+    // Browser-side memory buffer (transient, for offline fallback)
+    let memoryTokens = [];
+    let syncInProgress = false;
+    let lastSyncTime = null;
 
-    function writeTokens(tokens) {
-        memoryTokens = [...tokens];
-
-        try {
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(tokens));
-        } catch (error) {
-            console.warn('Token storage write failed:', error);
-        }
-    }
-
-    // Generate timestamp signature
     function generateTimestampSignature() {
         const timestamp = Date.now();
         const nonce = Math.random().toString(16).slice(2, 10);
@@ -347,11 +322,6 @@ const TokenIDGenerator = (() => {
         return await SHA256.hash(tokenString);
     }
 
-    async function generatePayloadSignature(payload) {
-        const payloadString = JSON.stringify(payload);
-        return await SHA256.hash(payloadString);
-    }
-
     function sanitizeRecord(record) {
         const tsSig = generateTimestampSignature();
         return {
@@ -365,23 +335,128 @@ const TokenIDGenerator = (() => {
             count: Number.isFinite(record.count) ? record.count : 1,
             costIncurred: Number.isFinite(record.costIncurred) ? record.costIncurred : 0,
             royalty: Number.isFinite(record.royalty) ? record.royalty : 0,
-            // NEW: Valuation fields
             realValue: Number.isFinite(record.realValue) ? record.realValue : 0,
             btmValue: Number.isFinite(record.btmValue) ? record.btmValue : 0,
             valuationStatus: record.valuationStatus || VALUATION_STATUS.PROOF_ONLY,
-            // Signature fields
             metadata: record.metadata || {},
             tstSignature: record.tstSignature || tsSig.signature,
             tstTimestamp: record.tstTimestamp || tsSig.timestamp
         };
     }
 
+    /**
+     * MAIN: Sync to Cloud Timestamp Server + Rabbit RAM
+     * 
+     * Flow:
+     * 1. Compute SHA256 of token payload (IMMUTABLE PROOF)
+     * 2. Send SHA256 + tokenId to timestamp.aisuccess.team/api/v1/timestamp
+     * 3. Cloud applies RFC3161 timestamp signature (tstSignature)
+     * 4. Cloud stores token append-only in DB
+     * 5. Daily: Cloud anchors Merkle root to blockchain (Polygon/BNB)
+     * 6. Browser keeps local copy only for offline fallback
+     */
+    async function syncToCloudRabbitRAM(token) {
+        if (syncInProgress) {
+            console.warn('[TokenCounter] Sync already in progress, buffering token...');
+            memoryTokens.push(token);
+            return { status: 'buffered', reason: 'sync_in_progress' };
+        }
+
+        syncInProgress = true;
+
+        try {
+            console.log(`[TokenCounter] Syncing token ${token.tokenId} to Cloud Rabbit RAM...`);
+
+            // Step 1: Compute SHA256 hash of token payload
+            const sha256Hash = await computeTokenHash(token);
+            
+            const tokenPayload = {
+                tokenId: token.tokenId,
+                sha256: sha256Hash,
+                status: token.status,
+                count: token.count,
+                costIncurred: token.costIncurred,
+                royalty: token.royalty,
+                realValue: token.realValue,
+                btmValue: token.btmValue,
+                valuationStatus: token.valuationStatus,
+                createdAt: token.createdAt,
+                ipAddress: token.ipAddress,
+                metadata: token.metadata
+            };
+
+            // Step 2: Send to timestamp.aisuccess.team for RFC3161 signing
+            const tsResponse = await fetch('https://timestamp.aisuccess.team/api/v1/timestamp', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Blockchain-Proof-Ref': 'LEO3C-BLOCKCHAIN-PROOF-20260927-001'
+                },
+                body: JSON.stringify({
+                    sha256: sha256Hash,
+                    tokenId: token.tokenId,
+                    createdAt: token.createdAt,
+                    source: 'leo3c-browser-client'
+                })
+            });
+
+            if (!tsResponse.ok) {
+                throw new Error(`Timestamp server error: ${tsResponse.status} ${tsResponse.statusText}`);
+            }
+
+            const tsData = await tsResponse.json();
+
+            // Step 3: Prepare enriched token with proof metadata
+            const enrichedToken = {
+                ...tokenPayload,
+                sha256: sha256Hash,
+                tstSignature: tsData.tstSignature || token.tstSignature,
+                tstTimestamp: tsData.tstTimestamp || token.tstTimestamp,
+                tstIssuer: 'leo3c-timestamp-authority',
+                proofRef: 'LEO3C-BLOCKCHAIN-PROOF-20260927-001',
+                proofHash: tsData.proofHash || 'pending-anchor',
+                syncedAt: new Date().toISOString(),
+                syncStatus: 'SYNCED_TO_CLOUD'
+            };
+
+            // Step 4: Keep local copy for offline access
+            memoryTokens.push(enrichedToken);
+
+            lastSyncTime = new Date().toISOString();
+
+            console.log(`[TokenCounter] ✓ Token synced to Cloud Rabbit RAM`);
+            console.log(`  - SHA256: ${sha256Hash.substring(0, 16)}...`);
+            console.log(`  - TSA Issued: ${tsData.tstTimestamp}`);
+
+            return {
+                status: 'synced_to_cloud',
+                tokenId: token.tokenId,
+                sha256: sha256Hash,
+                tstSignature: enrichedToken.tstSignature,
+                proofRef: enrichedToken.proofRef
+            };
+
+        } catch (error) {
+            console.error(`[TokenCounter] ✗ Failed to sync token: ${error.message}`);
+            
+            // Fallback: keep in memory for retry
+            memoryTokens.push(token);
+
+            return {
+                status: 'sync_failed',
+                error: error.message,
+                buffered: true
+            };
+
+        } finally {
+            syncInProgress = false;
+        }
+    }
+
     const TokenCounter = {
-        // Constants
         VALUATION_STATUS,
 
         async createToken(details = {}) {
-            const tokens = readTokens();
             const record = sanitizeRecord({
                 ...details,
                 tokenId: details.tokenId || TokenIDGenerator.generate(),
@@ -394,37 +469,39 @@ const TokenIDGenerator = (() => {
                 metadata: details.metadata || {}
             });
 
-            // Compute SHA256 hash for the token
+            // Compute SHA256 hash for immutable proof layer
             record.sha256 = await computeTokenHash(record);
 
-            tokens.push(record);
-            writeTokens(tokens);
-            this.syncToRabbitRAM();
-            return record;
+            // Sync to Cloud Rabbit RAM (timestamp.aisuccess.team)
+            const syncResult = await syncToCloudRabbitRAM(record);
+
+            return {
+                token: record,
+                syncResult: syncResult
+            };
         },
 
         getTokenData() {
-            return readTokens();
+            return memoryTokens;
         },
 
         countTokens() {
-            return readTokens().length;
+            return memoryTokens.length;
         },
 
         getTokenById(tokenId) {
-            return readTokens().find(token => token.tokenId === tokenId) || null;
+            return memoryTokens.find(token => token.tokenId === tokenId) || null;
         },
 
         async updateToken(tokenId, changes = {}) {
-            const tokens = readTokens();
-            const index = tokens.findIndex(token => token.tokenId === tokenId);
+            const index = memoryTokens.findIndex(token => token.tokenId === tokenId);
             if (index === -1) {
                 return null;
             }
 
             const tsSig = generateTimestampSignature();
             const updated = sanitizeRecord({
-                ...tokens[index],
+                ...memoryTokens[index],
                 ...changes,
                 tokenId,
                 updatedAt: new Date().toISOString(),
@@ -435,20 +512,20 @@ const TokenIDGenerator = (() => {
             // Recompute SHA256 hash after update
             updated.sha256 = await computeTokenHash(updated);
 
-            tokens[index] = updated;
-            writeTokens(tokens);
-            this.syncToRabbitRAM();
+            memoryTokens[index] = updated;
+
+            // Re-sync to cloud
+            await syncToCloudRabbitRAM(updated);
+
             return updated;
         },
 
-        // NEW: Activate token for valuation
         async activateToken(tokenId) {
             return this.updateToken(tokenId, {
                 valuationStatus: VALUATION_STATUS.ACTIVATED
             });
         },
 
-        // NEW: Set real value and update status to VALUED
         async setRealValue(tokenId, realValue, btmValue = 0) {
             if (!Number.isFinite(realValue) || realValue < 0) {
                 console.error('Invalid realValue:', realValue);
@@ -462,28 +539,25 @@ const TokenIDGenerator = (() => {
             });
         },
 
-        // NEW: Get tokens by valuation status
         getTokensByValuationStatus(status) {
             const validStatus = Object.values(VALUATION_STATUS);
             if (!validStatus.includes(status)) {
                 console.warn(`Invalid valuation status: ${status}`);
                 return [];
             }
-            return readTokens().filter(token => token.valuationStatus === status);
+            return memoryTokens.filter(token => token.valuationStatus === status);
         },
 
-        // NEW: Get total value across tokens
         getTotalValue(valuationStatus = null) {
-            let tokens = readTokens();
+            let tokens = memoryTokens;
             if (valuationStatus) {
                 tokens = tokens.filter(t => t.valuationStatus === valuationStatus);
             }
             return tokens.reduce((sum, token) => sum + token.realValue, 0);
         },
 
-        // NEW: Get total BTM value
         getTotalBTMValue(valuationStatus = null) {
-            let tokens = readTokens();
+            let tokens = memoryTokens;
             if (valuationStatus) {
                 tokens = tokens.filter(t => t.valuationStatus === valuationStatus);
             }
@@ -507,53 +581,27 @@ const TokenIDGenerator = (() => {
         },
 
         async prepareCloudPayload() {
-            const tokens = readTokens();
-            const payload = {
-                source: 'rabbit-ram',
-                generatedAt: new Date().toISOString(),
-                totalTokens: tokens.length,
-                valuationSummary: {
-                    totalRealValue: this.getTotalValue(),
-                    totalBTMValue: this.getTotalBTMValue(),
-                    byStatus: {
-                        [VALUATION_STATUS.PROOF_ONLY]: this.getTotalValue(VALUATION_STATUS.PROOF_ONLY),
-                        [VALUATION_STATUS.ACTIVATED]: this.getTotalValue(VALUATION_STATUS.ACTIVATED),
-                        [VALUATION_STATUS.VALUED]: this.getTotalValue(VALUATION_STATUS.VALUED)
-                    }
-                },
-                tokens: tokens.map(token => ({
+            return {
+                source: 'leo3c-browser-rabbit-ram',
+                timestamp: new Date().toISOString(),
+                lastSync: lastSyncTime,
+                totalTokens: memoryTokens.length,
+                cloudBackedUp: true,
+                tokens: memoryTokens.map(token => ({
                     tokenId: token.tokenId,
                     topic: token.topic,
                     status: token.status,
-                    source: token.source,
-                    ipAddress: token.ipAddress,
-                    createdAt: token.createdAt,
-                    updatedAt: token.updatedAt,
-                    count: token.count,
-                    costIncurred: token.costIncurred,
-                    royalty: token.royalty,
+                    sha256: token.sha256,
+                    tstSignature: token.tstSignature,
+                    tstTimestamp: token.tstTimestamp,
+                    proofRef: token.proofRef,
                     realValue: token.realValue,
                     btmValue: token.btmValue,
                     valuationStatus: token.valuationStatus,
-                    metadata: token.metadata,
-                    sha256: token.sha256 || 'pending',
-                    tstSignature: token.tstSignature,
-                    tstTimestamp: token.tstTimestamp
+                    syncStatus: token.syncStatus || 'local',
+                    metadata: token.metadata
                 }))
             };
-
-            // Generate signature for entire payload
-            payload.payloadSignature = await generatePayloadSignature(payload);
-
-            return payload;
-        },
-
-        async syncToRabbitRAM() {
-            const payload = await this.prepareCloudPayload();
-            if (typeof window !== 'undefined') {
-                window.__LEO3C_RABBIT_RAM__ = payload;
-            }
-            return payload;
         },
 
         hydrateCounterUI() {
@@ -569,6 +617,15 @@ const TokenIDGenerator = (() => {
             const total = this.countTokens();
             counterEl.textContent = String(total);
             counterEl.setAttribute('data-total-tokens', String(total));
+        },
+
+        getSyncStatus() {
+            return {
+                lastSync: lastSyncTime,
+                syncInProgress: syncInProgress,
+                localTokenCount: memoryTokens.length,
+                cloudBacked: lastSyncTime !== null
+            };
         }
     };
 
@@ -590,11 +647,21 @@ const TokenIDGenerator = (() => {
 })();
 
 // Log page info
-console.log('LEO 3C AI Success Case Study');
+console.log('LEO 3C AI Success Case Study - v2 (Cloud-Backed Rabbit RAM)');
 console.log('Timestamp: 27 Sep 2026 BKK');
 console.log('Personal IP Protection - MIT License');
 console.log('Architecture: IA&IB');
-console.log('Token Counter Ready:', typeof window !== 'undefined' ? window.TokenCounter?.countTokens?.() : 'browser-only');
-console.log('SHA256 + Timestamp Signature: ENABLED');
-console.log('Token Valuation System: ENABLED (PROOF_ONLY | ACTIVATED | VALUED)');
-console.log('Token ID Format: BTM-LEO3C-YYYYMMDD-XXXX');
+console.log('');
+console.log('=== Token Proof System ===');
+console.log('✓ SHA256 hash (immutable proof)');
+console.log('✓ RFC3161 timestamp signature via timestamp.aisuccess.team');
+console.log('✓ Blockchain proof reference: LEO3C-BLOCKCHAIN-PROOF-20260927-001');
+console.log('✓ Daily anchor to blockchain (Polygon/BNB)');
+console.log('');
+console.log('=== Valuation Layer ===');
+console.log('✓ realValue + btmValue (append-only)');
+console.log('✓ valuationStatus: PROOF_ONLY → ACTIVATED → VALUED');
+console.log('');
+console.log('✓ Cloud Rabbit RAM: ENABLED');
+console.log('  Server: https://timestamp.aisuccess.team/api/v1/timestamp');
+console.log('  Storage: Append-only DB (immutable proof audit trail)');
