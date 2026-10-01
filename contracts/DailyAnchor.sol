@@ -7,6 +7,7 @@ pragma solidity ^0.8.0;
  * ====================================================================
  * 
  * Owner: พุฒฬส ตระกูลทอง | AI-Success Foundation
+ * 
  * Purpose: 
  *   - Daily batch of BTM tokens → Merkle root
  *   - Anchor root to public chain (Polygon/BNB) at 00:00 UTC
@@ -15,11 +16,21 @@ pragma solidity ^0.8.0;
  *     2. AI-Success Platform usage ($10 entry)
  *     3. Blockchain transaction fees
  *
- * Model:
- *   - Tokens start as PROOF_ONLY (mined, not valued)
- *   - 6-month lifecycle per token
- *   - When actual revenue realized → realValue updated
- *   - This contract handles proof layer only (append-only)
+ * Payment Model (CORRECTED v2):
+ *   - User pays $10 USD entry fee
+ *   - $10 is recorded in Timestamp (append-only audit)
+ *   - $10 is collected by Owner directly to personal bank account (NOT in smart contract)
+ *   - Owner collects until system is fully operational
+ *   - When system ready: $10 stops being collected (no more new fees)
+ *   - Existing $10 payments → converted to BTM-TOKEN refund (value = $10 USD)
+ *
+ * Token Lifecycle:
+ *   - PROOF_ONLY → created (no value yet)
+ *   - 6-month proof-of-work window
+ *   - ACTIVATED → when revenue streams validated
+ *   - VALUED → when actual revenue realized + assessed
+ *   - REFUNDABLE → when system ready, BTM-TOKEN = $10 issued to payer
+ *   - After 6mo → EXPIRED (can renew for next cycle)
  *
  * Gas Cost: ~$0.05-0.20/day on Polygon (~$10/month)
  * ====================================================================
@@ -35,10 +46,24 @@ interface IMerkleValidator {
 
 contract DailyAnchor {
     // ====================================================================
-    // Types
+    // Types & Enums
     // ====================================================================
     
     enum ChainType { Polygon, BNBChain, Ethereum }
+    
+    enum RevenueStreamType { 
+        GPT_TRAINING,      // 0: AI discovery formula usage
+        PLATFORM_USAGE,    // 1: AI-Success platform subscription
+        TRANSACTION_FEE    // 2: Blockchain operation fees
+    }
+    
+    enum TokenStatus {
+        PROOF_ONLY,      // 0: Created, has sha256 + tstSignature, no value yet
+        ACTIVATED,       // 1: Revenue stream validated, proof-of-work active
+        VALUED,          // 2: Revenue realized, BTM-Token value assessed
+        REFUNDABLE,      // 3: Ready to refund as BTM-TOKEN ($10 value)
+        EXPIRED          // 4: 6-month window expired
+    }
     
     struct DailyAnchorRecord {
         uint256 anchorDate;           // YYYYMMDD
@@ -52,54 +77,83 @@ contract DailyAnchor {
         bool isValid;                 // Validation flag
     }
     
-    struct RevenueStream {
-        string streamName;            // "GPT_TRAINING" | "PLATFORM_USAGE" | "TRANSACTION_FEE"
-        uint256 tokenCountToday;      // BTM tokens generated today
-        uint256 realValueUSD;         // 0 until revenue realized
-        uint256 btmValueToken;        // 0 until revenue realized
-        uint256 lastUpdated;          // Last update timestamp
+    struct PaymentRecord {
+        string tokenId;               // BTM-LEO3C-20260927-0001
+        address paidBy;               // Original payer
+        uint256 paidAmountUSDCents;   // $10 entry fee (in cents = 1000)
+        uint256 paidAt;               // Timestamp when paid
+        bool isRefundedAsToken;       // false → true after system ready
+        uint256 refundedAt;           // null → timestamp when refunded
+        string refundTokenId;         // BTM-TOKEN issued as refund
+        string refundTxHash;          // Blockchain tx hash of refund (if on-chain)
+    }
+    
+    struct RevenueStreamDaily {
+        uint256 date;                 // YYYYMMDD
+        RevenueStreamType streamType;
+        uint256 tokenCountToday;      // How many tokens generated from this stream
+        uint256 totalRevenueUSD;      // Revenue amount in USD (0 if not yet realized)
+        uint256 btmTokenValue;        // Assessed BTM-Token value (0 if not yet assessed)
+        uint256 lastUpdated;          // Timestamp of last update
+        bool isRealized;              // true when actual revenue confirmed
+    }
+    
+    struct TokenMetadata {
+        string tokenId;               // BTM-LEO3C-20260927-0001
+        bytes32 sha256;               // Original SHA256 hash
+        string tstSignature;          // RFC3161 Timestamp signature
+        uint256 createdAt;            // Creation timestamp
+        uint256 expiresAt;            // createdAt + 6 months
+        TokenStatus status;           // Current lifecycle status
+        uint256 realValueUSD;         // Assessed USD value (0 initially)
+        uint256 btmTokenValue;        // Assessed BTM-Token value (0 initially)
+        RevenueStreamType revenueStream; // Which stream generated this token
+        bool isValid;                 // Verification flag
+        address owner;                // Token owner
     }
     
     // ====================================================================
-    // State
+    // State Variables
     // ====================================================================
     
-    address public owner;
+    address public contractOwner;
     address public foundationAddress;
     address public systemCostAddress;
     
+    bool public isSystemFullyOperational;  // Flag: when true, stop collecting $10 fees
+    
+    // Payment Configuration
     uint256 public constant PROOF_OF_WORK_DURATION = 6 * 30 days;  // 6 months in seconds
-    uint256 public constant TOKEN_ENTRY_FEE = 10 * 10**18;  // $10 USD in wei
+    uint256 public constant ENTRY_FEE_USD_CENTS = 1000;  // $10.00 in cents
+    uint256 public constant REFUND_BTM_VALUE_USD_CENTS = 1000;  // Refund as $10 worth of BTM-TOKEN
     
-    // Payment split (from $10 entry fee)
-    uint256 public constant FOUNDATION_PERCENT = 2;   // 2% = $0.20
-    uint256 public constant OWNER_PERCENT = 1;        // 1% = $0.10
-    uint256 public constant SYSTEM_PERCENT = 7;       // 7% = $0.70
-    uint256 public constant REFUND_PERCENT = 90;      // 90% = $9.00 as BTM-TOKEN
+    // Note: Entry fee is collected by owner OUTSIDE the contract
+    // It's just recorded here for audit trail only
     
-    // Daily anchors: date => DailyAnchorRecord
+    // Daily anchors: date (YYYYMMDD) => DailyAnchorRecord
     mapping(uint256 => DailyAnchorRecord) public dailyAnchors;
     mapping(uint256 => bool) public dailyAnchorExists;
     
-    // Revenue streams per day
-    mapping(uint256 => RevenueStream[3]) public dailyRevenueStreams;
-    
-    // Token registry: tokenId => token metadata
+    // Token registry: tokenId => TokenMetadata
     mapping(string => TokenMetadata) public tokenRegistry;
+    mapping(string => bool) public tokenExists;
     
-    struct TokenMetadata {
-        string tokenId;              // BTM-LEO3C-20260927-0001
-        bytes32 sha256;              // Original SHA256
-        uint256 createdAt;           // Creation timestamp
-        uint256 expiresAt;           // createdAt + 6 months
-        string status;               // PROOF_ONLY | ACTIVATED | VALUED
-        uint256 realValue;           // USD value (0 initially)
-        uint256 btmValue;            // BTM token value (0 initially)
-        uint8 revenueStream;         // 0=GPT, 1=Platform, 2=Txn
-        bool isValid;                // Verification flag
-    }
+    // Payment records: tokenId => PaymentRecord
+    mapping(string => PaymentRecord) public paymentRecords;
+    mapping(string => bool) public paymentExists;
     
+    // Revenue streams: streamId => RevenueStreamDaily
+    mapping(string => RevenueStreamDaily) public revenueStreams;
+    uint256 public revenueStreamCount = 0;
+    
+    // Historical records
     uint256[] public allAnchorDates;
+    string[] public allTokenIds;
+    string[] public allPaymentTokenIds;
+    
+    // Stats
+    uint256 public totalCollectedFeesUSDCents = 0;  // $10 * count
+    uint256 public totalRefundedAsTokens = 0;       // Count of refunded tokens
     
     // ====================================================================
     // Events
@@ -111,28 +165,59 @@ contract DailyAnchor {
         uint256 tokenCount,
         string chain,
         bytes32 txHash,
-        uint256 timestamp
+        uint256 timestamp,
+        string proofRef
     );
     
     event TokenRegistered(
         string indexed tokenId,
         bytes32 sha256,
         uint8 revenueStream,
-        string status
+        string status,
+        address owner
+    );
+    
+    event PaymentRecorded(
+        string indexed tokenId,
+        address indexed paidBy,
+        uint256 amount,
+        uint256 timestamp
+    );
+    
+    event TokenStatusUpdated(
+        string indexed tokenId,
+        string oldStatus,
+        string newStatus,
+        uint256 timestamp
     );
     
     event TokenValuated(
         string indexed tokenId,
-        uint256 realValue,
-        uint256 btmValue,
-        string status
+        uint256 realValueUSD,
+        uint256 btmTokenValue,
+        uint256 timestamp
+    );
+    
+    event RefundIssuedAsToken(
+        string indexed tokenId,
+        address indexed paidBy,
+        string refundTokenId,
+        uint256 btmTokenValueUSD,
+        string refundTxHash,
+        uint256 timestamp
     );
     
     event RevenueStreamUpdated(
         uint256 indexed date,
-        uint8 streamIndex,
+        uint8 streamType,
         uint256 tokenCount,
-        uint256 realValue
+        uint256 revenueUSD,
+        bool isRealized
+    );
+    
+    event SystemOperationalStatusChanged(
+        bool isOperational,
+        uint256 timestamp
     );
     
     // ====================================================================
@@ -140,17 +225,22 @@ contract DailyAnchor {
     // ====================================================================
     
     modifier onlyOwner() {
-        require(msg.sender == owner, "Only owner");
+        require(msg.sender == contractOwner, "Only owner can call this");
         _;
     }
     
     modifier validDate(uint256 dateYYYYMMDD) {
-        require(dateYYYYMMDD >= 20260901 && dateYYYYMMDD <= 20991231, "Invalid date");
+        require(dateYYYYMMDD >= 20260901 && dateYYYYMMDD <= 20991231, "Invalid date format");
         _;
     }
     
     modifier noDoubleAnchor(uint256 date) {
         require(!dailyAnchorExists[date], "Anchor already exists for this date");
+        _;
+    }
+    
+    modifier tokenMustExist(string memory _tokenId) {
+        require(tokenExists[_tokenId], "Token not found in registry");
         _;
     }
     
@@ -162,13 +252,17 @@ contract DailyAnchor {
         address _foundationAddress,
         address _systemCostAddress
     ) {
-        owner = msg.sender;
+        require(_foundationAddress != address(0), "Invalid foundation address");
+        require(_systemCostAddress != address(0), "Invalid system cost address");
+        
+        contractOwner = msg.sender;
         foundationAddress = _foundationAddress;
         systemCostAddress = _systemCostAddress;
+        isSystemFullyOperational = false;  // Initially NOT operational
     }
     
     // ====================================================================
-    // Core: Daily Anchor
+    // Core: Daily Anchor (Proof Layer)
     // ====================================================================
     
     /**
@@ -176,9 +270,9 @@ contract DailyAnchor {
      * 
      * Flow:
      * 1. Batch all tokens created yesterday
-     * 2. Compute Merkle root
-     * 3. Store on public chain
-     * 4. Record immutably
+     * 2. Compute Merkle root from sha256 + tstSignature
+     * 3. Submit to public chain (Polygon/BNB)
+     * 4. Record immutably (append-only)
      */
     function createDailyAnchor(
         uint256 _date,
@@ -216,7 +310,8 @@ contract DailyAnchor {
             _tokenCount,
             chainTypeToString(_chain),
             _txHash,
-            block.timestamp
+            block.timestamp,
+            _proofRef
         );
     }
     
@@ -232,271 +327,6 @@ contract DailyAnchor {
         return dailyAnchors[_date];
     }
     
-    // ====================================================================
-    // Token Registration (3 Revenue Streams)
-    // ====================================================================
-    
-    /**
-     * @dev Register a new BTM token
-     * 
-     * Revenue streams:
-     * 0 = GPT Training Data (discovery formula)
-     * 1 = AI-Success Platform Usage ($10 entry)
-     * 2 = Blockchain Transaction Fees
-     */
-    function registerToken(
-        string memory _tokenId,
-        bytes32 _sha256,
-        uint8 _revenueStream,  // 0, 1, or 2
-        string memory _status  // "PROOF_ONLY"
-    ) 
-        external 
-        onlyOwner
-    {
-        require(_revenueStream <= 2, "Invalid revenue stream");
-        require(
-            keccak256(abi.encodePacked(_status)) == keccak256(abi.encodePacked("PROOF_ONLY")),
-            "Initial status must be PROOF_ONLY"
-        );
-        
-        uint256 createdAt = block.timestamp;
-        uint256 expiresAt = createdAt + PROOF_OF_WORK_DURATION;
-        
-        TokenMetadata memory token = TokenMetadata({
-            tokenId: _tokenId,
-            sha256: _sha256,
-            createdAt: createdAt,
-            expiresAt: expiresAt,
-            status: _status,
-            realValue: 0,
-            btmValue: 0,
-            revenueStream: _revenueStream,
-            isValid: true
-        });
-        
-        tokenRegistry[_tokenId] = token;
-        
-        // Update revenue stream count
-        uint256 today = getCurrentDateYYYYMMDD();
-        dailyRevenueStreams[today][_revenueStream].tokenCountToday++;
-        dailyRevenueStreams[today][_revenueStream].lastUpdated = block.timestamp;
-        
-        emit TokenRegistered(_tokenId, _sha256, _revenueStream, _status);
-    }
-    
-    // ====================================================================
-    // Token Valuation (Only when revenue realized)
-    // ====================================================================
-    
-    /**
-     * @dev Valuate a token when actual revenue is realized
-     * 
-     * This is ONLY called after revenue comes in from:
-     * - GPT training usage fees
-     * - Platform subscription
-     * - Blockchain transaction proceeds
-     * 
-     * Until then: realValue = 0 (just proof, no valuation)
-     */
-    function valuateToken(
-        string memory _tokenId,
-        uint256 _realValueUSD,
-        uint256 _btmValueToken,
-        string memory _newStatus  // "ACTIVATED" or "VALUED"
-    ) 
-        external 
-        onlyOwner
-    {
-        require(tokenRegistry[_tokenId].isValid, "Token not found");
-        require(_realValueUSD > 0 || _btmValueToken > 0, "Must have some value");
-        
-        TokenMetadata storage token = tokenRegistry[_tokenId];
-        require(
-            keccak256(abi.encodePacked(token.status)) == keccak256(abi.encodePacked("PROOF_ONLY")) ||
-            keccak256(abi.encodePacked(token.status)) == keccak256(abi.encodePacked("ACTIVATED")),
-            "Can only valuate PROOF_ONLY or ACTIVATED tokens"
-        );
-        
-        token.realValue = _realValueUSD;
-        token.btmValue = _btmValueToken;
-        token.status = _newStatus;
-        
-        // Update daily revenue stream
-        uint256 today = getCurrentDateYYYYMMDD();
-        dailyRevenueStreams[today][token.revenueStream].realValueUSD += _realValueUSD;
-        dailyRevenueStreams[today][token.revenueStream].btmValueToken += _btmValueToken;
-        
-        emit TokenValuated(_tokenId, _realValueUSD, _btmValueToken, _newStatus);
-    }
-    
-    /**
-     * @dev Get token details
-     */
-    function getToken(string memory _tokenId) 
-        external 
-        view 
-        returns (TokenMetadata memory) 
-    {
-        require(tokenRegistry[_tokenId].isValid, "Token not found");
-        return tokenRegistry[_tokenId];
-    }
-    
-    /**
-     * @dev Check if token is expired (6 months after creation)
-     */
-    function isTokenExpired(string memory _tokenId) 
-        external 
-        view 
-        returns (bool) 
-    {
-        TokenMetadata memory token = tokenRegistry[_tokenId];
-        return block.timestamp > token.expiresAt;
-    }
-    
-    // ====================================================================
-    // Payment Distribution (Entry Fee)
-    // ====================================================================
-    
-    /**
-     * @dev Distribute $10 entry fee
-     * 
-     * Split:
-     * - 2% ($0.20) → Foundation (AS_F)
-     * - 1% ($0.10) → Owner
-     * - 7% ($0.70) → System Cost (infrastructure)
-     * - 90% ($9.00) → Refund as BTM-TOKEN (to user)
-     */
-    function distributeEntryFee() 
-        external 
-        payable 
-        onlyOwner
-    {
-        require(msg.value == TOKEN_ENTRY_FEE, "Must send exactly $10");
-        
-        uint256 toFoundation = (msg.value * FOUNDATION_PERCENT) / 100;
-        uint256 toOwner = (msg.value * OWNER_PERCENT) / 100;
-        uint256 toSystem = (msg.value * SYSTEM_PERCENT) / 100;
-        // uint256 refundBTM = (msg.value * REFUND_PERCENT) / 100;  // Minted as BTM-TOKEN
-        
-        // Send to addresses
-        (bool successF, ) = foundationAddress.call{value: toFoundation}("");
-        require(successF, "Foundation transfer failed");
-        
-        (bool successO, ) = owner.call{value: toOwner}("");
-        require(successO, "Owner transfer failed");
-        
-        (bool successS, ) = systemCostAddress.call{value: toSystem}("");
-        require(successS, "System cost transfer failed");
-        
-        // Refund portion ($9) is minted as BTM-TOKEN by separate contract
-        // (not handled here - see BTMToken.sol)
-    }
-    
-    // ====================================================================
-    // Revenue Stream Management
-    // ====================================================================
-    
-    /**
-     * @dev Get revenue stream stats for a date
-     * 
-     * Streams:
-     * 0 = "GPT_TRAINING"
-     * 1 = "PLATFORM_USAGE"
-     * 2 = "TRANSACTION_FEE"
-     */
-    function getRevenueStream(uint256 _date, uint8 _streamIndex)
-        external
-        view
-        returns (RevenueStream memory)
-    {
-        require(_streamIndex <= 2, "Invalid stream index");
-        return dailyRevenueStreams[_date][_streamIndex];
-    }
-    
-    /**
-     * @dev Update revenue stream when actual revenue comes in
-     */
-    function updateRevenueStream(
-        uint256 _date,
-        uint8 _streamIndex,
-        uint256 _realValue
-    )
-        external
-        onlyOwner
-    {
-        require(_streamIndex <= 2, "Invalid stream index");
-        
-        RevenueStream storage stream = dailyRevenueStreams[_date][_streamIndex];
-        stream.realValueUSD = _realValue;
-        stream.lastUpdated = block.timestamp;
-        
-        emit RevenueStreamUpdated(_date, _streamIndex, stream.tokenCountToday, _realValue);
-    }
-    
-    // ====================================================================
-    // Proof-of-Work Duration: 6 Months
-    // ====================================================================
-    
-    /**
-     * @dev Check token's remaining proof-of-work time
-     * @return remaining seconds until expiry
-     */
-    function getProofOfWorkRemaining(string memory _tokenId)
-        external
-        view
-        returns (uint256)
-    {
-        TokenMetadata memory token = tokenRegistry[_tokenId];
-        if (block.timestamp >= token.expiresAt) {
-            return 0;
-        }
-        return token.expiresAt - block.timestamp;
-    }
-    
-    /**
-     * @dev Renew token for another 6-month cycle
-     * (Called when user renews after expiry)
-     */
-    function renewToken(string memory _tokenId)
-        external
-        onlyOwner
-    {
-        TokenMetadata storage token = tokenRegistry[_tokenId];
-        require(block.timestamp > token.expiresAt, "Token not expired yet");
-        
-        token.expiresAt = block.timestamp + PROOF_OF_WORK_DURATION;
-        token.status = "PROOF_ONLY";  // Reset to proof-only for new cycle
-        token.realValue = 0;
-        token.btmValue = 0;
-    }
-    
-    // ====================================================================
-    // Utilities
-    // ====================================================================
-    
-    function chainTypeToString(ChainType _chain) 
-        internal 
-        pure 
-        returns (string memory) 
-    {
-        if (_chain == ChainType.Polygon) return "Polygon";
-        if (_chain == ChainType.BNBChain) return "BNB Chain";
-        return "Ethereum";
-    }
-    
-    function getCurrentDateYYYYMMDD() 
-        internal 
-        view 
-        returns (uint256) 
-    {
-        uint256 timestamp = block.timestamp;
-        // Simplified: just return a day identifier
-        // In production: use proper date library
-        return (timestamp / 86400) * 10000 + 
-               ((timestamp / 3600) % 24) * 100 +
-               ((timestamp / 60) % 60);
-    }
-    
     function getAnchorCount() 
         external 
         view 
@@ -506,20 +336,481 @@ contract DailyAnchor {
     }
     
     // ====================================================================
-    // Admin
+    // Token Registration & Lifecycle
+    // ====================================================================
+    
+    /**
+     * @dev Register a new BTM token
+     * 
+     * Revenue streams:
+     * 0 = GPT_TRAINING (AI discovery formula)
+     * 1 = PLATFORM_USAGE (AI-Success platform subscription)
+     * 2 = TRANSACTION_FEE (blockchain operation fees)
+     * 
+     * Initial status: PROOF_ONLY (no value yet)
+     */
+    function registerToken(
+        string memory _tokenId,
+        bytes32 _sha256,
+        string memory _tstSignature,
+        uint8 _revenueStreamType,
+        address _tokenOwner
+    ) 
+        external 
+        onlyOwner
+    {
+        require(!tokenExists[_tokenId], "Token already registered");
+        require(_revenueStreamType <= 2, "Invalid revenue stream type");
+        require(_tokenOwner != address(0), "Invalid token owner");
+        
+        uint256 createdAt = block.timestamp;
+        uint256 expiresAt = createdAt + PROOF_OF_WORK_DURATION;
+        
+        TokenMetadata memory token = TokenMetadata({
+            tokenId: _tokenId,
+            sha256: _sha256,
+            tstSignature: _tstSignature,
+            createdAt: createdAt,
+            expiresAt: expiresAt,
+            status: TokenStatus.PROOF_ONLY,
+            realValueUSD: 0,
+            btmTokenValue: 0,
+            revenueStream: RevenueStreamType(_revenueStreamType),
+            isValid: true,
+            owner: _tokenOwner
+        });
+        
+        tokenRegistry[_tokenId] = token;
+        tokenExists[_tokenId] = true;
+        allTokenIds.push(_tokenId);
+        
+        emit TokenRegistered(
+            _tokenId,
+            _sha256,
+            _revenueStreamType,
+            "PROOF_ONLY",
+            _tokenOwner
+        );
+    }
+    
+    /**
+     * @dev Get token details
+     */
+    function getToken(string memory _tokenId) 
+        external 
+        view 
+        tokenMustExist(_tokenId)
+        returns (TokenMetadata memory) 
+    {
+        return tokenRegistry[_tokenId];
+    }
+    
+    /**
+     * @dev Update token status
+     * Transition: PROOF_ONLY → ACTIVATED → VALUED → REFUNDABLE → EXPIRED
+     */
+    function updateTokenStatus(
+        string memory _tokenId,
+        TokenStatus _newStatus
+    )
+        external
+        onlyOwner
+        tokenMustExist(_tokenId)
+    {
+        TokenMetadata storage token = tokenRegistry[_tokenId];
+        TokenStatus oldStatus = token.status;
+        
+        // Validate state transitions
+        if (_newStatus == TokenStatus.ACTIVATED) {
+            require(oldStatus == TokenStatus.PROOF_ONLY, "Can only activate PROOF_ONLY tokens");
+        } else if (_newStatus == TokenStatus.VALUED) {
+            require(
+                oldStatus == TokenStatus.PROOF_ONLY || oldStatus == TokenStatus.ACTIVATED,
+                "Can only value PROOF_ONLY or ACTIVATED tokens"
+            );
+        } else if (_newStatus == TokenStatus.REFUNDABLE) {
+            require(isSystemFullyOperational, "System must be fully operational first");
+            require(
+                oldStatus == TokenStatus.PROOF_ONLY || 
+                oldStatus == TokenStatus.ACTIVATED ||
+                oldStatus == TokenStatus.VALUED,
+                "Can only refund before expiry"
+            );
+        } else if (_newStatus == TokenStatus.EXPIRED) {
+            require(block.timestamp > token.expiresAt, "Token not yet expired");
+        }
+        
+        token.status = _newStatus;
+        
+        emit TokenStatusUpdated(
+            _tokenId,
+            statusToString(oldStatus),
+            statusToString(_newStatus),
+            block.timestamp
+        );
+    }
+    
+    /**
+     * @dev Check if token is expired (6 months after creation)
+     */
+    function isTokenExpired(string memory _tokenId) 
+        external 
+        view 
+        tokenMustExist(_tokenId)
+        returns (bool) 
+    {
+        TokenMetadata memory token = tokenRegistry[_tokenId];
+        return block.timestamp > token.expiresAt;
+    }
+    
+    /**
+     * @dev Get remaining proof-of-work time
+     * @return remaining seconds until expiry
+     */
+    function getProofOfWorkRemaining(string memory _tokenId)
+        external
+        view
+        tokenMustExist(_tokenId)
+        returns (uint256)
+    {
+        TokenMetadata memory token = tokenRegistry[_tokenId];
+        if (block.timestamp >= token.expiresAt) {
+            return 0;
+        }
+        return token.expiresAt - block.timestamp;
+    }
+    
+    // ====================================================================
+    // Payment Recording (Audit Only — $10 collected outside contract)
+    // ====================================================================
+    
+    /**
+     * @dev Record $10 entry fee payment
+     * 
+     * Important: 
+     * - $10 payment is recorded here ONLY for audit trail
+     * - $10 is collected by Owner directly to personal bank account
+     * - Not stored in smart contract
+     * - Owner collects until isSystemFullyOperational = true
+     * - Then: existing payments converted to BTM-TOKEN refund
+     */
+    function recordPayment(
+        string memory _tokenId,
+        address _paidBy,
+        uint256 _amountUSDCents
+    )
+        external
+        onlyOwner
+        tokenMustExist(_tokenId)
+    {
+        require(!paymentExists[_tokenId], "Payment already recorded for this token");
+        require(_paidBy != address(0), "Invalid payer address");
+        require(_amountUSDCents == ENTRY_FEE_USD_CENTS, "Must be exactly $10");
+        require(!isSystemFullyOperational, "Cannot record new payments - system operational");
+        
+        PaymentRecord memory payment = PaymentRecord({
+            tokenId: _tokenId,
+            paidBy: _paidBy,
+            paidAmountUSDCents: _amountUSDCents,
+            paidAt: block.timestamp,
+            isRefundedAsToken: false,
+            refundedAt: 0,
+            refundTokenId: "",
+            refundTxHash: ""
+        });
+        
+        paymentRecords[_tokenId] = payment;
+        paymentExists[_tokenId] = true;
+        allPaymentTokenIds.push(_tokenId);
+        totalCollectedFeesUSDCents += _amountUSDCents;
+        
+        emit PaymentRecorded(_tokenId, _paidBy, _amountUSDCents, block.timestamp);
+    }
+    
+    /**
+     * @dev Get payment record
+     */
+    function getPaymentRecord(string memory _tokenId)
+        external
+        view
+        returns (PaymentRecord memory)
+    {
+        require(paymentExists[_tokenId], "No payment record for this token");
+        return paymentRecords[_tokenId];
+    }
+    
+    /**
+     * @dev Get total collected fees (in USD cents)
+     * Example: 10 * $10 = 100000 cents = $1000
+     */
+    function getTotalCollectedFees()
+        external
+        view
+        returns (uint256)
+    {
+        return totalCollectedFeesUSDCents;
+    }
+    
+    // ====================================================================
+    // Token Valuation (Only when revenue is realized)
+    // ====================================================================
+    
+    /**
+     * @dev Valuate token when revenue streams are confirmed
+     * 
+     * Called when:
+     * - GPT training revenue confirmed
+     * - Platform subscription received
+     * - Transaction fees realized
+     * 
+     * Then: Token moves toward REFUNDABLE status
+     */
+    function valuateToken(
+        string memory _tokenId,
+        uint256 _realValueUSD,
+        uint256 _btmTokenValue
+    )
+        external
+        onlyOwner
+        tokenMustExist(_tokenId)
+    {
+        TokenMetadata storage token = tokenRegistry[_tokenId];
+        require(
+            token.status == TokenStatus.PROOF_ONLY || 
+            token.status == TokenStatus.ACTIVATED,
+            "Can only valuate PROOF_ONLY or ACTIVATED tokens"
+        );
+        
+        token.realValueUSD = _realValueUSD;
+        token.btmTokenValue = _btmTokenValue;
+        token.status = TokenStatus.VALUED;
+        
+        emit TokenValuated(_tokenId, _realValueUSD, _btmTokenValue, block.timestamp);
+    }
+    
+    // ====================================================================
+    // Refund as BTM-TOKEN (When system is ready)
+    // ====================================================================
+    
+    /**
+     * @dev Issue BTM-TOKEN refund (value = $10)
+     * 
+     * Called after:
+     * 1. System is fully operational (isSystemFullyOperational = true)
+     * 2. Revenue streams calculated
+     * 3. Ready to convert $10 payments to BTM-TOKEN
+     * 
+     * Refund = BTM-TOKEN (minted externally by BTMToken.sol)
+     * Value = $10 USD equivalent
+     * No cash refund
+     */
+    function issueRefundAsToken(
+        string memory _tokenId,
+        string memory _refundTokenId,
+        string memory _refundTxHash
+    )
+        external
+        onlyOwner
+        tokenMustExist(_tokenId)
+    {
+        require(paymentExists[_tokenId], "No payment record for this token");
+        require(isSystemFullyOperational, "System must be fully operational");
+        
+        PaymentRecord storage payment = paymentRecords[_tokenId];
+        require(!payment.isRefundedAsToken, "Already refunded as token");
+        
+        TokenMetadata storage token = tokenRegistry[_tokenId];
+        require(
+            token.status == TokenStatus.PROOF_ONLY ||
+            token.status == TokenStatus.ACTIVATED ||
+            token.status == TokenStatus.VALUED,
+            "Cannot refund expired tokens"
+        );
+        
+        // Mark as refunded with BTM-TOKEN
+        payment.isRefundedAsToken = true;
+        payment.refundedAt = block.timestamp;
+        payment.refundTokenId = _refundTokenId;
+        payment.refundTxHash = _refundTxHash;
+        
+        // Update token status
+        token.status = TokenStatus.REFUNDABLE;
+        
+        totalRefundedAsTokens++;
+        
+        emit RefundIssuedAsToken(
+            _tokenId,
+            payment.paidBy,
+            _refundTokenId,
+            REFUND_BTM_VALUE_USD_CENTS,
+            _refundTxHash,
+            block.timestamp
+        );
+    }
+    
+    // ====================================================================
+    // System Status Management
+    // ====================================================================
+    
+    /**
+     * @dev Mark system as fully operational
+     * 
+     * After calling this:
+     * - Cannot record new $10 payments
+     * - Can start issuing BTM-TOKEN refunds
+     * - Existing payments converted to BTM-TOKEN ($10 value each)
+     */
+    function markSystemAsOperational()
+        external
+        onlyOwner
+    {
+        require(!isSystemFullyOperational, "System already operational");
+        isSystemFullyOperational = true;
+        
+        emit SystemOperationalStatusChanged(true, block.timestamp);
+    }
+    
+    /**
+     * @dev Get system operational status
+     */
+    function getSystemStatus()
+        external
+        view
+        returns (bool isOperational, uint256 totalFeesCollected, uint256 totalRefunded)
+    {
+        return (isSystemFullyOperational, totalCollectedFeesUSDCents, totalRefundedAsTokens);
+    }
+    
+    // ====================================================================
+    // Revenue Streams Management
+    // ====================================================================
+    
+    /**
+     * @dev Create or update revenue stream
+     * 
+     * Streams:
+     * 0 = GPT_TRAINING: AI discovery formula revenue
+     * 1 = PLATFORM_USAGE: AI-Success platform subscription
+     * 2 = TRANSACTION_FEE: Blockchain operation fees
+     */
+    function updateRevenueStream(
+        uint256 _date,
+        uint8 _streamType,
+        uint256 _tokenCount,
+        uint256 _revenueUSD,
+        bool _isRealized
+    )
+        external
+        onlyOwner
+        validDate(_date)
+    {
+        require(_streamType <= 2, "Invalid stream type");
+        
+        string memory streamId = keccak256(abi.encodePacked(_date, _streamType));
+        
+        if (revenueStreams[streamId].date == 0) {
+            revenueStreams[streamId] = RevenueStreamDaily({
+                date: _date,
+                streamType: RevenueStreamType(_streamType),
+                tokenCountToday: _tokenCount,
+                totalRevenueUSD: _revenueUSD,
+                btmTokenValue: 0,
+                lastUpdated: block.timestamp,
+                isRealized: _isRealized
+            });
+            revenueStreamCount++;
+        } else {
+            revenueStreams[streamId].tokenCountToday = _tokenCount;
+            revenueStreams[streamId].totalRevenueUSD = _revenueUSD;
+            revenueStreams[streamId].isRealized = _isRealized;
+            revenueStreams[streamId].lastUpdated = block.timestamp;
+        }
+        
+        emit RevenueStreamUpdated(_date, _streamType, _tokenCount, _revenueUSD, _isRealized);
+    }
+    
+    /**
+     * @dev Get revenue stream
+     */
+    function getRevenueStream(uint256 _date, uint8 _streamType)
+        external
+        view
+        returns (RevenueStreamDaily memory)
+    {
+        require(_streamType <= 2, "Invalid stream type");
+        string memory streamId = keccak256(abi.encodePacked(_date, _streamType));
+        return revenueStreams[streamId];
+    }
+    
+    // ====================================================================
+    // Utilities & Helpers
+    // ====================================================================
+    
+    function chainTypeToString(ChainType _chain) 
+        internal 
+        pure 
+        returns (string memory) 
+    {
+        if (_chain == ChainType.Polygon) return "Polygon";
+        if (_chain == ChainType.BNBChain) return "BNB Chain";
+        if (_chain == ChainType.Ethereum) return "Ethereum";
+        return "Unknown";
+    }
+    
+    function statusToString(TokenStatus _status)
+        internal
+        pure
+        returns (string memory)
+    {
+        if (_status == TokenStatus.PROOF_ONLY) return "PROOF_ONLY";
+        if (_status == TokenStatus.ACTIVATED) return "ACTIVATED";
+        if (_status == TokenStatus.VALUED) return "VALUED";
+        if (_status == TokenStatus.REFUNDABLE) return "REFUNDABLE";
+        if (_status == TokenStatus.EXPIRED) return "EXPIRED";
+        return "UNKNOWN";
+    }
+    
+    function getTokenCount() 
+        external 
+        view 
+        returns (uint256) 
+    {
+        return allTokenIds.length;
+    }
+    
+    function getPaymentCount()
+        external
+        view
+        returns (uint256)
+    {
+        return allPaymentTokenIds.length;
+    }
+    
+    function getRevenueStreamCount()
+        external
+        view
+        returns (uint256)
+    {
+        return revenueStreamCount;
+    }
+    
+    // ====================================================================
+    // Admin Functions
     // ====================================================================
     
     function transferOwnership(address _newOwner) 
         external 
         onlyOwner 
     {
-        owner = _newOwner;
+        require(_newOwner != address(0), "Invalid new owner");
+        contractOwner = _newOwner;
     }
     
     function updateFoundationAddress(address _newAddress) 
         external 
         onlyOwner 
     {
+        require(_newAddress != address(0), "Invalid address");
         foundationAddress = _newAddress;
     }
     
@@ -527,6 +818,7 @@ contract DailyAnchor {
         external 
         onlyOwner 
     {
+        require(_newAddress != address(0), "Invalid address");
         systemCostAddress = _newAddress;
     }
 }
